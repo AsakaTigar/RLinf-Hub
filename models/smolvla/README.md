@@ -65,6 +65,10 @@ Transformers at `4.57.6`. The lock also uses `datasets==4.8.0` because
 4.57's `<1.0` requirement. `torchcodec==0.10.0` satisfies LeRobot 0.4.4's
 `<0.11.0` cap.
 
+On minimal Linux images, `torchcodec` also needs the system FFmpeg shared
+libraries. If importing LeRobot fails with a missing `libavcodec`/`libavformat`,
+install FFmpeg (for example, `apt-get install -y ffmpeg`).
+
 ## Register with RLinf
 
 Run commands from the Hub root:
@@ -165,28 +169,77 @@ log.
 
 ## Evidence
 
-Local validation used Windows 11, Python 3.12.16, Torch 2.10.0+cu128 (CUDA 12.8),
-and an RTX 5070 Ti (sm_120) with NVIDIA driver 621.14 and a 300 W power limit.
-The CPU suite passed 8 tests, including a real LeRobot normalize/unnormalize
-round trip. The GPU suite passed 3 real-checkpoint tests (all 11 tests green),
-and FP16/BF16 matrix multiplications were verified on sm_120. The checkpoint
-contains 906,712,520 bytes and has SHA256
+### Linux A100 validation (primary)
+
+Validated on Ubuntu 26.04.1 LTS with 2x NVIDIA A100-SXM4-80GB GPUs (driver
+595.99.02, 400 W power limit), Python 3.12.16, PyTorch 2.10.0+cu128 (CUDA 12.8),
+Ray 2.60.1, RLinf 0.3.0, LeRobot 0.4.4, Transformers 4.57.1, and torchcodec
+0.10.0. The checkpoint contains 906,712,520 bytes with SHA256
 `7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb`
-(revision `5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6`); loading it took 45.4 s in
-the audit run.
+(revision `5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6`); loading it took 32.0 s.
 
-### Latency: 90 measured samples per precision
+The full suite passed **11/11 tests in 112.77 s** (8 CPU contract tests and 3
+real-checkpoint GPU tests), including a real LeRobot normalize/unnormalize round
+trip. Each GPU test returned a finite CPU FP32 `[1, 50, 6]` tensor.
 
-Batch size is 1. All precisions reuse the same loaded model, observations, and
-noise. Each precision runs three independent rounds; every round performs two
-warmup calls followed by 30 measured `predict_action_batch` calls, so each
-precision contributes six warmup calls and 90 measured calls. The measured
-boundary is the full adapter call, including preprocessing, tokenization,
-flow-matching inference, and postprocessing. `torch.cuda.synchronize()` wraps
-every measured call, and `empty_cache()` is never called while timing. The GPU
-idled at P8 before the run (25.35 W, 1,200 MHz SM, 405 MHz memory) and settled at
-P1 afterwards (67.14 W, 2,887 MHz SM, 13,801 MHz memory, 14% utilization).
-Values are milliseconds over all 90 samples (`n=90`).
+Ray distributed check: a local Ray cluster with two workers, one A100 per
+worker, registered the model solely through `RLINF_EXT_MODULE=smolvla` (no manual
+import). Both workers loaded the official checkpoint, ran BF16 autocast
+inference, and returned finite `[1, 50, 6]` actions (287.34 ms and 283.43 ms).
+The driver finished with `RAY_SMOKE_OK` and exit code 0. This validates
+distributed registration and inference, not a task-level benchmark rollout.
+
+### Latency: 90 measured samples per precision (A100)
+
+Batch size is 1. Each precision runs three independent rounds; every round
+performs two warmup calls followed by 30 measured `predict_action_batch` calls,
+so each precision contributes six warmup calls and 90 measured calls. The
+measured boundary is the full adapter call, including preprocessing,
+tokenization, flow-matching inference, and postprocessing.
+`torch.cuda.synchronize()` wraps every measured call, and `empty_cache()` is
+never called while timing. The GPU reported P0 at 34.53 W before the run and P0
+at 50.11 W after it (32% utilization). Values are milliseconds over all 90
+samples (`n=90`).
+
+| Precision | First forward | P50 | P95 | Mean | Std | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FP32 | 946.82 | 251.80 | 261.82 | 253.49 | 5.85 | 248.71 | 297.88 |
+| FP16 autocast | 3,995.21 | 275.47 | 285.15 | 276.39 | 4.61 | 270.67 | 295.17 |
+| BF16 autocast | 294.11 | 269.32 | 278.06 | 270.54 | 3.91 | 265.68 | 284.41 |
+
+All three modes returned finite CPU FP32 `[1, 50, 6]` actions. The first call
+after each mode switch is reported separately and is excluded from the
+steady-state columns.
+
+### Weight storage vs compute vs output dtype
+
+The precision switch only enables CUDA autocast; it does not quantize or
+re-store weights. The Linux audit reproduced the same histogram as the Windows
+run.
+
+| Stage | FP32 mode | FP16 mode | BF16 mode |
+|---|---|---|---|
+| Checkpoint tensor storage (on disk) | mixed: 474 BF16 tensors (446,772,624 elements) + 26 F32 tensors (3,273,552 elements) | same checkpoint | same checkpoint |
+| Loaded parameters in the adapter | 500 `torch.float32` tensors (450,046,176 elements) + 2 FP32 buffers (64 elements) | same FP32 master weights | same FP32 master weights |
+| Autocast state during inference | disabled (`actual_autocast_dtype=None`) | enabled, `torch.float16` | enabled, `torch.bfloat16` |
+| Probe `nn.Linear` output dtype | `torch.float32` | `torch.float16` | `torch.bfloat16` |
+| Adapter output | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` |
+
+The audit read the safetensors header directly and counted 500 parameter tensors
+plus 2 buffers on the loaded model. All three modes returned finite outputs of
+shape `[1, 50, 6]`.
+
+### Windows RTX 5070 Ti cross-platform check (supplementary)
+
+Windows 11 validation used Python 3.12.16, Torch 2.10.0+cu128, an RTX 5070 Ti
+(sm_120) with driver 621.14 and a 300 W power limit. The same 11 tests passed,
+and FP16/BF16 matrix multiplications were verified on sm_120. Model loading took
+45.4 s in that run. The checkpoint SHA256 and revision match the Linux run.
+
+Batch size is 1; each precision again uses three rounds of two warmup calls plus
+30 measured calls (90 samples). The GPU idled at P8 before the run (25.35 W,
+1,200 MHz SM, 405 MHz memory) and settled at P1 afterwards (67.14 W, 2,887 MHz
+SM, 13,801 MHz memory, 14% utilization).
 
 | Precision | P50 | P95 | Mean | Std | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
@@ -206,30 +259,13 @@ First forward after each mode switch took 3,759.8 ms (FP32), 782.4 ms (FP16),
 and 740.9 ms (BF16). Model load (45.4 s), warmups, and these first calls are
 excluded from the table above.
 
-### Weight storage vs compute vs output dtype
-
-The precision switch only enables CUDA autocast; it does not quantize or
-re-store weights.
-
-| Stage | FP32 mode | FP16 mode | BF16 mode |
-|---|---|---|---|
-| Checkpoint tensor storage (on disk) | mixed: 474 BF16 tensors (446,772,624 elements) + 26 F32 tensors (3,273,552 elements) | same checkpoint | same checkpoint |
-| Loaded parameters in the adapter | 500 `torch.float32` tensors (450,046,176 elements) + 2 FP32 buffers (64 elements) | same FP32 master weights | same FP32 master weights |
-| Autocast state during inference | disabled (`actual_autocast_dtype=None`) | enabled, `torch.float16` | enabled, `torch.bfloat16` |
-| Probe `nn.Linear` output dtype | `torch.float32` | `torch.float16` | `torch.bfloat16` |
-| Adapter output | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` |
-
-The audit read the safetensors header directly and counted 500 parameter tensors
-plus 2 buffers on the loaded model. All three modes returned finite outputs of
-shape `[1, 50, 6]`.
-
-### Earlier measurements (retained, different protocol)
+### Earlier Windows measurements (retained, different protocol)
 
 These were measured before the 90-sample audit with a shorter protocol: one
 session, two warmups, and ten measured calls per precision, plus separate
 cold-start calls in fresh processes. They are kept as historical records and are
-not overwritten by the table above; the sample counts and session differ, so the
-two sets are not directly comparable.
+not overwritten by the tables above; the sample counts and session differ, so the
+sets are not directly comparable.
 
 | Precision | Action shape | Finite | Cold first call | Steady P50 (n=10) | Steady mean (n=10) | Peak CUDA (steady) |
 |---|---|---|---:|---:|---:|---:|
@@ -241,7 +277,7 @@ Raw logs and per-call latency samples are retained in a separate local evidence
 bundle for the PR description. They are intentionally not shipped inside
 `models/smolvla/`.
 
-A complete distributed RLinf evaluation is still pending on Linux. The GDUT SSH
-entry points were rate-limited during this run; the local evidence validates
-registration, contracts, normalization, strict checkpoint loading, and all three
-inference precisions, not a benchmark success rate.
+This adapter is inference-only. Linux validation covers contract tests and
+two-worker Ray distributed registration/inference; it does not include a
+task-level benchmark rollout or success rate. Training, actor replay, and
+PPO/GRPO logprobs remain unimplemented and raise `NotImplementedError`.

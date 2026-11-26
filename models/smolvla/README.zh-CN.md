@@ -62,6 +62,10 @@ huggingface-cli download lerobot/smolvla_base \
 Transformers 4.57 的 `<1.0` 要求冲突。`torchcodec==0.10.0` 满足 LeRobot
 0.4.4 的 `<0.11.0` 上限。
 
+在极简 Linux 镜像中，`torchcodec` 还需要系统 FFmpeg 共享库。如果导入 LeRobot
+时报缺少 `libavcodec`/`libavformat`，请安装 FFmpeg（例如
+`apt-get install -y ffmpeg`）。
+
 ## 向 RLinf 注册
 
 在 Hub 根目录执行：
@@ -159,24 +163,69 @@ CUDA_VISIBLE_DEVICES=0 SMOLVLA_GPU_SMOKE=1 \
 
 ## 验证证据
 
-本地验证环境为 Windows 11、Python 3.12.16、Torch 2.10.0+cu128（CUDA 12.8），
-显卡为 RTX 5070 Ti（sm_120），NVIDIA 驱动 621.14，功耗上限 300 W。CPU 套件
-通过 8 项测试，其中包含真实的 LeRobot normalize/unnormalize 往返；GPU 套件
-通过 3 项真实 checkpoint 测试（合计 11 项全部通过），并验证了 sm_120 上的
-FP16/BF16 矩阵乘法。Checkpoint 大小为 906,712,520 字节，SHA256 为
+### Linux A100 主验证
+
+验证环境为 Ubuntu 26.04.1 LTS、2× NVIDIA A100-SXM4-80GB（驱动 595.99.02，
+功耗上限 400 W）、Python 3.12.16、PyTorch 2.10.0+cu128（CUDA 12.8）、
+Ray 2.60.1、RLinf 0.3.0、LeRobot 0.4.4、Transformers 4.57.1 与
+torchcodec 0.10.0。Checkpoint 大小为 906,712,520 字节，SHA256 为
 `7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb`
-（revision `5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6`）；本次审计中加载耗时
-45.4 秒。
+（revision `5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6`）；加载耗时 32.0 秒。
 
-### 延迟：每种精度 90 个正式样本
+全量测试 **11/11 通过，耗时 112.77 秒**（8 项 CPU 契约测试 + 3 项真实
+checkpoint GPU 测试），其中包含真实的 LeRobot normalize/unnormalize 往返。
+每个 GPU 测试都返回有限的 CPU FP32 `[1, 50, 6]` 张量。
 
-Batch size 为 1。所有精度复用同一份已加载模型、同一组观测与噪声。每种精度
-独立执行三轮；每轮先做两次 warmup，再执行 30 次正式 `predict_action_batch`
-调用，因此每种精度共 6 次 warmup 与 90 次正式调用。计时边界是完整的适配器调用，包含预处理、tokenization、flow-matching
+Ray 分布式验证：本地 Ray 集群启动 2 个 worker，每个 worker 独占一张 A100，
+仅通过 `RLINF_EXT_MODULE=smolvla` 完成自动注册，没有手动 import。两个 worker
+都严格加载官方 checkpoint，执行 BF16 autocast 前向，返回有限的
+`[1, 50, 6]` 动作（287.34 ms 与 283.43 ms）。驱动进程以 `RAY_SMOKE_OK`
+和退出码 0 结束。该验证覆盖分布式注册与推理，不包含任务级 benchmark rollout。
+
+### 延迟：每种精度 90 个正式样本（A100）
+
+Batch size 为 1。每种精度独立执行三轮；每轮先做两次 warmup，再执行 30 次
+正式 `predict_action_batch` 调用，因此每种精度共 6 次 warmup 与 90 次正式
+调用。计时边界是完整的适配器调用，包含预处理、tokenization、flow-matching
 推理与后处理。每次正式调用都用 `torch.cuda.synchronize()` 包裹，计时期间
-从不调用 `empty_cache()`。测试前 GPU 处于 P8（25.35 W、SM 1,200 MHz、显存
-405 MHz），测试后稳定在 P1（67.14 W、SM 2,887 MHz、显存 13,801 MHz、利用率
-14%）。下表中数值为全部 90 个样本的毫秒数（`n=90`）。
+从不调用 `empty_cache()`。测试前 GPU 处于 P0（34.53 W），测试后仍为 P0
+（50.11 W、利用率 32%）。下表中数值为全部 90 个样本的毫秒数（`n=90`）。
+
+| 精度 | 首次 forward | P50 | P95 | 均值 | 标准差 | 最小值 | 最大值 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FP32 | 946.82 | 251.80 | 261.82 | 253.49 | 5.85 | 248.71 | 297.88 |
+| FP16 autocast | 3,995.21 | 275.47 | 285.15 | 276.39 | 4.61 | 270.67 | 295.17 |
+| BF16 autocast | 294.11 | 269.32 | 278.06 | 270.54 | 3.91 | 265.68 | 284.41 |
+
+三种模式都返回有限的 CPU FP32 `[1, 50, 6]` 动作。每次切换精度后的首次调用
+单独列出，不计入稳态统计。
+
+### 权重存储、计算与输出 dtype
+
+精度开关只启用 CUDA autocast；它不会量化或重新存储权重。Linux 审计复现了
+与 Windows 完全一致的 dtype 直方图。
+
+| 阶段 | FP32 模式 | FP16 模式 | BF16 模式 |
+|---|---|---|---|
+| Checkpoint 张量存储（磁盘上） | 混合：474 个 BF16 张量（446,772,624 个元素）+ 26 个 F32 张量（3,273,552 个元素） | 同一 checkpoint | 同一 checkpoint |
+| 适配器加载后的参数 | 500 个 `torch.float32` 张量（450,046,176 个元素）+ 2 个 FP32 buffer（64 个元素） | 同样的 FP32 主权重 | 同样的 FP32 主权重 |
+| 推理时 autocast 状态 | 关闭（`actual_autocast_dtype=None`） | 开启，`torch.float16` | 开启，`torch.bfloat16` |
+| 探针 `nn.Linear` 输出 dtype | `torch.float32` | `torch.float16` | `torch.bfloat16` |
+| 适配器输出 | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` |
+
+审计直接读取 safetensors header，并在加载后的模型上统计到 500 个参数张量与
+2 个 buffer。三种模式都返回有限的 `[1, 50, 6]` 输出。
+
+### Windows RTX 5070 Ti 跨平台补充验证
+
+Windows 11 环境使用 Python 3.12.16、Torch 2.10.0+cu128、RTX 5070 Ti
+（sm_120），驱动 621.14，功耗上限 300 W。同样的 11 项测试全部通过，并在
+sm_120 上验证了 FP16/BF16 矩阵乘法；该轮模型加载耗时 45.4 秒。Checkpoint
+的 SHA256 与 revision 与 Linux 一致。
+
+Batch size 为 1；每种精度同样执行三轮、每轮两次 warmup 加 30 次正式调用
+（90 个样本）。测试前 GPU 处于 P8（25.35 W、SM 1,200 MHz、显存 405 MHz），
+测试后稳定在 P1（67.14 W、SM 2,887 MHz、显存 13,801 MHz、利用率 14%）。
 
 | 精度 | P50 | P95 | 均值 | 标准差 | 最小值 | 最大值 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -193,22 +242,7 @@ Batch size 为 1。所有精度复用同一份已加载模型、同一组观测�
 每次切换精度后的首次 forward 分别耗时 3,759.8 ms（FP32）、782.4 ms（FP16）、
 740.9 ms（BF16）。模型加载（45.4 秒）、warmup 与这些首次调用均不计入上表。
 
-### 权重存储、计算与输出 dtype
-
-精度开关只启用 CUDA autocast；它不会量化或重新存储权重。
-
-| 阶段 | FP32 模式 | FP16 模式 | BF16 模式 |
-|---|---|---|---|
-| Checkpoint 张量存储（磁盘上） | 混合：474 个 BF16 张量（446,772,624 个元素）+ 26 个 F32 张量（3,273,552 个元素） | 同一 checkpoint | 同一 checkpoint |
-| 适配器加载后的参数 | 500 个 `torch.float32` 张量（450,046,176 个元素）+ 2 个 FP32 buffer（64 个元素） | 同样的 FP32 主权重 | 同样的 FP32 主权重 |
-| 推理时 autocast 状态 | 关闭（`actual_autocast_dtype=None`） | 开启，`torch.float16` | 开启，`torch.bfloat16` |
-| 探针 `nn.Linear` 输出 dtype | `torch.float32` | `torch.float16` | `torch.bfloat16` |
-| 适配器输出 | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` | CPU `torch.float32` `[B,50,6]` |
-
-审计直接读取 safetensors header，并在加载后的模型上统计到 500 个参数张量与
-2 个 buffer。三种模式都返回有限的 `[1, 50, 6]` 输出。
-
-### 早期测量（保留，协议不同）
+### 早期 Windows 测量（保留，协议不同）
 
 以下数据在 90 样本审计之前测得，协议更短：单次会话、两次 warmup、每种精度
 十次正式调用，另在独立进程中测量冷启动。它们作为历史记录保留，不会被上表
@@ -223,6 +257,6 @@ Batch size 为 1。所有精度复用同一份已加载模型、同一组观测�
 原始日志与逐次延迟样本保存在独立的本地证据包中，供 PR 描述使用；它们刻意
 不放入 `models/smolvla/`。
 
-完整的 RLinf 分布式评测仍待 Linux 环境补跑。本次运行期间 GDUT 的 SSH 入口
-受到限流；本地证据验证的是注册、契约、归一化、严格 checkpoint 加载以及三种
-推理精度，而不是 benchmark success rate。
+本适配器仅用于推理。Linux 验证覆盖契约测试与双 worker Ray 分布式注册/推理，
+不包含任务级 benchmark rollout 或成功率。训练、actor replay 与 PPO/GRPO
+logprob 仍未实现，相关路径会抛出 `NotImplementedError`。
