@@ -23,6 +23,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from lerobot.policies.factory import (
+    make_pre_post_processors as real_make_pre_post_processors,
+)
+from lerobot.processor.batch_processor import AddBatchDimensionProcessorStep
+from lerobot.processor.device_processor import DeviceProcessorStep
 from omegaconf import OmegaConf
 from rlinf.config import SupportedModel
 from rlinf.models import get_model
@@ -86,8 +91,10 @@ class _FakeLeRobotPolicy(nn.Module):
 
 
 class _FakePreprocessor:
-    def __init__(self, state: dict, add_batch_step: object) -> None:
-        self.steps = [add_batch_step, SimpleNamespace(name="normalize")]
+    def __init__(
+        self, state: dict, add_batch_step: object, device_step: object
+    ) -> None:
+        self.steps = [add_batch_step, device_step, SimpleNamespace(name="normalize")]
         self.state = state
 
     def __call__(self, batch: dict) -> dict:
@@ -104,32 +111,43 @@ def vendor_stubs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
     from lerobot.policies import factory
     from lerobot.policies.smolvla import modeling_smolvla
     from lerobot.processor.batch_processor import AddBatchDimensionProcessorStep
+    from lerobot.processor.device_processor import DeviceProcessorStep
 
     class FakeAddBatchStep(AddBatchDimensionProcessorStep):
         def __init__(self) -> None:
             pass
 
-    state = {"config": _fake_model_config(), "factory_args": None}
+    state = {
+        "config": _fake_model_config(),
+        "factory_args": None,
+        "download_calls": [],
+        "from_pretrained_calls": [],
+    }
     policy = _FakeLeRobotPolicy(state["config"])
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"type": "smolvla"}), encoding="utf-8")
-    monkeypatch.setattr(
-        huggingface_hub, "hf_hub_download", lambda *args, **kwargs: str(config_path)
-    )
+
+    def download_config(*args, **kwargs):
+        state["download_calls"].append({"args": args, "kwargs": kwargs})
+        return str(config_path)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download_config)
 
     def from_pretrained(*args, **kwargs):
+        state["from_pretrained_calls"].append({"args": args, "kwargs": kwargs})
         return policy
 
     def make_pre_post_processors(*args, **kwargs):
         state["factory_args"] = {"args": args, "kwargs": kwargs}
         state["preprocessor_input"] = None
         state["postprocessor_input"] = None
+        device_step = DeviceProcessorStep(device=args[0].device, float_dtype=None)
 
         def postprocess(actions):
             state["postprocessor_input"] = actions
             return actions / 2.0
 
-        return _FakePreprocessor(state, FakeAddBatchStep()), postprocess
+        return _FakePreprocessor(state, FakeAddBatchStep(), device_step), postprocess
 
     def parse_config(config_cls, path, *args, **kwargs):
         state["parsed_config_data"] = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -187,7 +205,9 @@ def test_register_is_idempotent() -> None:
     assert SupportedModel.get("smolvla").value == "smolvla"
 
 
-def test_builder_uses_upstream_and_unit_stats(vendor_stubs: dict) -> None:
+def test_builder_uses_upstream_and_unit_stats(
+    vendor_stubs: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = _load_config()
     adapter = build_smolvla(cfg, torch.float32)
 
@@ -195,7 +215,7 @@ def test_builder_uses_upstream_and_unit_stats(vendor_stubs: dict) -> None:
     assert "type" not in vendor_stubs["parsed_config_data"]
     assert adapter.policy.anchor.dtype == torch.float32
     assert adapter.compute_dtype == torch.float32
-    assert len(adapter.preprocessor.steps) == 1
+    assert len(adapter.preprocessor.steps) == 2
     assert vendor_stubs["config"].device == "cpu"
     assert vendor_stubs["config"].dtype == torch.float32
     assert vendor_stubs["config"].load_vlm_weights is False
@@ -204,24 +224,187 @@ def test_builder_uses_upstream_and_unit_stats(vendor_stubs: dict) -> None:
 
     factory_args = vendor_stubs["factory_args"]
     assert factory_args["kwargs"]["pretrained_path"] is None
+    assert "preprocessor_overrides" not in factory_args["kwargs"]
     dataset_stats = factory_args["kwargs"]["dataset_stats"]
     assert torch.equal(dataset_stats["observation.state"]["mean"], torch.zeros(6))
     assert torch.equal(dataset_stats["observation.state"]["std"], torch.ones(6))
     assert torch.equal(dataset_stats["action"]["mean"], torch.zeros(6))
     assert torch.equal(dataset_stats["action"]["std"], torch.ones(6))
-    assert factory_args["kwargs"]["preprocessor_overrides"] == {
-        "device_processor": {"device": "cpu", "float_dtype": None}
+
+    device_steps = [
+        step
+        for step in adapter.preprocessor.steps
+        if isinstance(step, DeviceProcessorStep)
+    ]
+    assert len(device_steps) == 1
+    assert device_steps[0].tensor_device.type == "cpu"
+    assert device_steps[0].float_dtype is None
+    assert not any(
+        isinstance(step, AddBatchDimensionProcessorStep)
+        for step in adapter.preprocessor.steps
+    )
+
+    assert len(vendor_stubs["download_calls"]) == 1
+    download = vendor_stubs["download_calls"][0]
+    assert download["kwargs"] == {
+        "repo_id": cfg.model_path,
+        "filename": "config.json",
+        "revision": cfg.model_revision,
     }
+    loaded = vendor_stubs["from_pretrained_calls"][0]
+    assert loaded["args"][0] == cfg.model_path
+    assert loaded["kwargs"]["revision"] == cfg.model_revision
+    assert loaded["kwargs"]["strict"] is True
+
+    # Exercise the real LeRobot factory without downloading a tokenizer.
+    from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.policies.smolvla import processor_smolvla
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    monkeypatch.setattr(
+        processor_smolvla.TokenizerProcessorStep,
+        "__init__",
+        lambda self, **kwargs: setattr(self, "kwargs", kwargs),
+    )
+    features = {
+        "observation.state": PolicyFeature(FeatureType.STATE, (6,)),
+        "observation.images.camera1": PolicyFeature(FeatureType.VISUAL, (3, 256, 256)),
+        "observation.images.camera2": PolicyFeature(FeatureType.VISUAL, (3, 256, 256)),
+        "observation.images.camera3": PolicyFeature(FeatureType.VISUAL, (3, 256, 256)),
+    }
+    real_config = SmolVLAConfig(
+        input_features=features,
+        output_features={"action": PolicyFeature(FeatureType.ACTION, (6,))},
+        chunk_size=50,
+        max_action_dim=32,
+        device="cpu",
+        normalization_mapping={
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.MEAN_STD,
+        },
+    )
+    real_stats = {
+        "observation.state": {
+            "mean": torch.zeros(6),
+            "std": torch.ones(6),
+        },
+        "action": {"mean": torch.zeros(6), "std": torch.ones(6)},
+    }
+    real_preprocessor, real_postprocessor = real_make_pre_post_processors(
+        real_config,
+        pretrained_path=None,
+        dataset_stats=real_stats,
+        preprocessor_overrides={
+            "device_processor": {"device": "cuda", "float_dtype": "float16"}
+        },
+    )
+    real_device_steps = [
+        step
+        for step in real_preprocessor.steps
+        if isinstance(step, DeviceProcessorStep)
+    ]
+    assert len(real_device_steps) == 1
+    assert real_device_steps[0].tensor_device.type == "cpu"
+    assert real_device_steps[0].float_dtype is None
+    assert any(
+        isinstance(step, AddBatchDimensionProcessorStep)
+        for step in real_preprocessor.steps
+    )
+    tokenizer_steps = [
+        step
+        for step in real_preprocessor.steps
+        if isinstance(step, processor_smolvla.TokenizerProcessorStep)
+    ]
+    assert len(tokenizer_steps) == 1
+    assert tokenizer_steps[0].kwargs["tokenizer_name"] == real_config.vlm_model_name
+    assert real_postprocessor.steps[-1].tensor_device.type == "cpu"
 
 
-def test_get_model_resolves_precision(vendor_stubs: dict) -> None:
+@pytest.mark.parametrize(
+    ("precision", "dtype"),
+    [
+        ("fp32", torch.float32),
+        ("fp16", torch.float16),
+        ("bf16", torch.bfloat16),
+    ],
+)
+def test_get_model_resolves_precision(
+    vendor_stubs: dict, precision: str, dtype: torch.dtype
+) -> None:
     register()
     cfg = _load_config()
-    cfg.precision = "fp16"
+    cfg.precision = precision
     model = get_model(cfg)
     assert isinstance(model, SmolVLAForRLActionPrediction)
     assert model.policy.anchor.dtype == torch.float32
-    assert model.compute_dtype == torch.float16
+    assert model.compute_dtype == dtype
+
+
+def test_local_checkpoint_directory_skips_hub_download(
+    vendor_stubs: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import huggingface_hub
+
+    local_dir = tmp_path / "checkpoint"
+    local_dir.mkdir()
+    (local_dir / "config.json").write_text(
+        json.dumps({"type": "smolvla"}), encoding="utf-8"
+    )
+
+    def fail_download(*args, **kwargs):
+        raise AssertionError("local checkpoint must not call hf_hub_download")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fail_download)
+    cfg = _load_config()
+    cfg.model_path = str(local_dir)
+    adapter = build_smolvla(cfg, torch.float32)
+
+    assert vendor_stubs["download_calls"] == []
+    assert len(vendor_stubs["from_pretrained_calls"]) == 1
+    loaded = vendor_stubs["from_pretrained_calls"][0]
+    assert loaded["args"][0] == str(local_dir)
+    assert loaded["kwargs"]["revision"] == cfg.model_revision
+    assert loaded["kwargs"]["strict"] is True
+    assert adapter.policy is vendor_stubs["policy"]
+
+
+def test_incomplete_local_checkpoint_directory_raises(
+    vendor_stubs: dict, tmp_path: Path
+) -> None:
+    local_dir = tmp_path / "empty-checkpoint"
+    local_dir.mkdir()
+    cfg = _load_config()
+    cfg.model_path = str(local_dir)
+
+    with pytest.raises(FileNotFoundError, match="config.json"):
+        build_smolvla(cfg, torch.float32)
+
+    assert vendor_stubs["download_calls"] == []
+    assert vendor_stubs["from_pretrained_calls"] == []
+
+
+def test_network_remote_checkpoint_files_resolve() -> None:
+    if os.environ.get("SMOLVLA_NETWORK_SMOKE") != "1":
+        pytest.skip("set SMOLVLA_NETWORK_SMOKE=1 to resolve the real HF checkpoint")
+
+    from huggingface_hub import hf_hub_download
+
+    cfg = _load_config()
+    config_path = hf_hub_download(
+        repo_id=cfg.model_path,
+        filename="config.json",
+        revision=cfg.model_revision,
+    )
+    weights_path = hf_hub_download(
+        repo_id=cfg.model_path,
+        filename="model.safetensors",
+        revision=cfg.model_revision,
+    )
+    assert Path(config_path).is_file()
+    assert Path(weights_path).is_file()
+    config_data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    assert config_data.get("type") == "smolvla"
 
 
 def test_predict_action_maps_and_postprocesses(vendor_stubs: dict) -> None:
@@ -335,6 +518,77 @@ def test_lerobot_normalization_round_trip() -> None:
         restored["observation"]["observation.state"], state, rtol=1e-6, atol=1e-6
     )
     torch.testing.assert_close(restored["action"], action, rtol=1e-6, atol=1e-6)
+
+
+def test_hydra_fragment_composes() -> None:
+    from hydra import compose, initialize_config_dir
+
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name="smolvla")
+    assert cfg.model_type == "smolvla"
+    assert cfg.model_path == "lerobot/smolvla_base"
+    assert int(cfg.num_action_chunks) == 50
+    assert int(cfg.action_dim) == 6
+
+
+def test_gpu_local_checkpoint_smoke() -> None:
+    if os.environ.get("SMOLVLA_GPU_SMOKE") != "1":
+        pytest.skip("set SMOLVLA_GPU_SMOKE=1 to run the real checkpoint")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the real checkpoint smoke test")
+
+    from huggingface_hub import hf_hub_download
+
+    cfg = _load_config()
+    config_path = hf_hub_download(
+        repo_id=cfg.model_path,
+        filename="config.json",
+        revision=cfg.model_revision,
+    )
+    weights_path = hf_hub_download(
+        repo_id=cfg.model_path,
+        filename="model.safetensors",
+        revision=cfg.model_revision,
+    )
+    local_dir = Path(config_path).parent
+    assert Path(weights_path).parent == local_dir
+    assert (local_dir / "model.safetensors").is_file()
+    cfg.model_path = str(local_dir)
+    cfg.precision = "fp32"
+    adapter = build_smolvla(cfg, torch.float32).to("cuda").eval()
+    torch.manual_seed(0)
+    env_obs = {
+        "main_images": torch.rand(1, 32, 32, 3),
+        "extra_view_images": torch.rand(1, 2, 32, 32, 3),
+        "states": torch.zeros(1, 6),
+        "task_descriptions": ["pick up the block"],
+    }
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    actions, _ = adapter.predict_action_batch(env_obs, mode="eval")
+    torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    assert actions.shape == (1, 50, 6)
+    assert actions.dtype == torch.float32
+    assert actions.device.type == "cpu"
+    assert torch.isfinite(actions).all()
+    logger.info(
+        json.dumps(
+            {
+                "checkpoint": cfg.model_path,
+                "source": "local",
+                "precision": cfg.precision,
+                "action_shape": list(actions.shape),
+                "finite": True,
+                "latency_ms": elapsed_ms,
+                "peak_cuda_memory_mib": torch.cuda.max_memory_allocated() / 2**20,
+                "gpu": torch.cuda.get_device_name(0),
+            }
+        )
+    )
 
 
 @pytest.mark.parametrize(

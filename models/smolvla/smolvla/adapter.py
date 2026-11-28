@@ -45,9 +45,7 @@ def _to_chw_float(images: torch.Tensor) -> torch.Tensor:
 class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
     """Inference-only RLinf wrapper around the upstream LeRobot SmolVLA policy."""
 
-    def __init__(
-        self, cfg: DictConfig, torch_dtype: torch.dtype | None = None
-    ) -> None:
+    def __init__(self, cfg: DictConfig, torch_dtype: torch.dtype | None = None) -> None:
         super().__init__()
         import draccus
         from huggingface_hub import hf_hub_download
@@ -59,11 +57,21 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
         from lerobot.processor.batch_processor import AddBatchDimensionProcessorStep
 
         self.cfg = cfg
-        config_path = hf_hub_download(
-            repo_id=cfg.model_path,
-            filename="config.json",
-            revision=cfg.model_revision,
-        )
+        model_path = Path(cfg.model_path)
+        if model_path.is_dir():
+            local_config = model_path / "config.json"
+            if not local_config.is_file():
+                raise FileNotFoundError(
+                    f"Local checkpoint directory {model_path} does not contain "
+                    "config.json"
+                )
+            config_path = str(local_config)
+        else:
+            config_path = hf_hub_download(
+                repo_id=cfg.model_path,
+                filename="config.json",
+                revision=cfg.model_revision,
+            )
         with open(config_path, encoding="utf-8") as handle:
             config_data = json.load(handle)
         # Newer checkpoints add a registry tag that LeRobot 0.4.4 rejects.
@@ -131,9 +139,6 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
             model_config,
             pretrained_path=None,
             dataset_stats=dataset_stats,
-            preprocessor_overrides={
-                "device_processor": {"device": "cpu", "float_dtype": None}
-            },
         )
         # RLinf already supplies a batch; LeRobot's default step would add another.
         self.preprocessor.steps = [
